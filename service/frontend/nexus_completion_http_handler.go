@@ -231,11 +231,7 @@ func (h *nexusCompletionHandler) CompleteOperation(ctx context.Context, r *nexus
 		return nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "invalid completion state")
 	}
 
-	if len(completion.GetComponentRef()) > 0 {
-		err = h.completeChasmOperation(ctx, logger, completion, successPayload, r, links)
-	} else {
-		err = h.completeHSMOperation(ctx, completion, successPayload, r, links)
-	}
+	err = h.completeOperation(ctx, logger, completion, successPayload, r, links, h.Config.EnableChasm(ns.Name().String()))
 	if err == nil {
 		return nil
 	}
@@ -249,6 +245,50 @@ func (h *nexusCompletionHandler) CompleteOperation(ctx context.Context, r *nexus
 		return commonnexus.ConvertGRPCError(err, true)
 	}
 	return commonnexus.ConvertGRPCError(err, false)
+}
+
+// completeOperation dispatches the completion to the framework its token targets (CHASM when a
+// ComponentRef is present, otherwise HSM). A rebuild (reset or conflict resolution) can flip an
+// operation between HSM and CHASM by dynamic config after the callback token was minted, so the
+// token's framework may no longer match the operation. If the operation was not found in its
+// original framework, the token is converted to the other framework and tried once more. Identity
+// is re-established by request ID, so the fallback only runs when the token carries one.
+//
+// chasmEnabled gates the HSM->CHASM direction: a workflow in a CHASM-disabled namespace has no
+// CHASM tree, so converting to CHASM would be futile (and the CHASM engine would flag it).
+func (h *nexusCompletionHandler) completeOperation(
+	ctx context.Context,
+	logger log.Logger,
+	completion *tokenspb.NexusOperationCompletion,
+	successPayload *commonpb.Payload,
+	req *nexusrpc.CompletionRequest,
+	links []*commonpb.Link,
+	chasmEnabled bool,
+) error {
+	isChasm := len(completion.GetComponentRef()) > 0
+	var err error
+	if isChasm {
+		err = h.completeChasmOperation(ctx, logger, completion, successPayload, req, links)
+	} else {
+		err = h.completeHSMOperation(ctx, completion, successPayload, req, links)
+	}
+	if _, notFound := errors.AsType[*serviceerror.NotFound](err); !notFound || completion.GetRequestId() == "" {
+		return err
+	}
+	// Converting HSM -> CHASM is only meaningful when the namespace has CHASM enabled (and thus a
+	// CHASM tree); CHASM -> HSM is always safe since HSM is the legacy default.
+	if !isChasm && !chasmEnabled {
+		return err
+	}
+	converted, convErr := convertCompletionToOtherFramework(completion)
+	if convErr != nil {
+		logger.Warn("failed to convert nexus completion token to the other framework", tag.Error(convErr))
+		return err
+	}
+	if isChasm {
+		return h.completeHSMOperation(ctx, converted, successPayload, req, links)
+	}
+	return h.completeChasmOperation(ctx, logger, converted, successPayload, req, links)
 }
 
 func (h *nexusCompletionHandler) completeHSMOperation(
